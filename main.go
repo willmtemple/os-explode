@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
@@ -25,8 +24,6 @@ import (
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/watch"
-
-	"github.com/docker/docker/pkg/archive"
 )
 
 const programUsage = `os-watcher - watch OpenShift v3 API for changes
@@ -112,8 +109,8 @@ func newWatchClient(baseurl, token, namespace, basedir string) (*watchClient, er
 		Logger: log.WithFields(log.Fields{
 			"baseurl":     baseurl,
 			"insecure":    insecure,
-			"namespace":   namespace,
 			"reposubpath": repodir,
+			"namespace":   namespace,
 		}),
 		Namespace: namespace,
 		OSTreeConfig: ostreeConfig{
@@ -159,26 +156,32 @@ func main() {
 }
 
 // Produce a branch name (for OSTree, ostensibly) from an imagestream and its tag
-func getBranch(is *imageapi.ImageStream, tag string) string {
+func getFullRef(is *imageapi.ImageStream, tag string) string {
 	return path.Join(is.ObjectMeta.Namespace, is.ObjectMeta.Name, tag)
 }
 
 // Get the digest commited into a branch
-func (wc *watchClient) digestForBranch(branch string) string {
-	logentries, err := ostree.Log(wc.OSTreeConfig.FullPath, branch, ostree.NewLogOptions())
+func (wc *watchClient) digestForRef(imgref string) string {
+	file, err := os.OpenFile(path.Join(wc.OSTreeConfig.BasePath, "images", imgref, "link"), os.O_CREATE, 0744)
 	if err != nil {
-		log.WithFields(log.Fields{
-			"branch": branch,
-			"repo":   wc.OSTreeConfig.FullPath,
-		}).Warn("No such branch (possibly new image).")
+		log.WithField("img", imgref).Warn("No such reference")
 		return ""
 	}
-	return logentries[0].Subject
+	defer file.Close()
+
+	var digest []byte
+	digest = make([]byte, 72)
+	if n, err := file.Read(digest); err != nil {
+		log.WithField("imgref", imgref).Error("Could not read ref")
+	} else if n != 72 {
+		log.Warn("Digest read unexpected length")
+	}
+	return string(digest)
 }
 
 // Get the root path of the blob store. This should make the blobs available if they are not already
-// e.g. if using a registry or FTP, etc.
-func (wc *watchClient) getBlobPath(branch string) string {
+// e.g. if using a registry or FTP, etc. For now, only the file:// (local storage) scheme is supported
+func (wc *watchClient) getBlobPath() string {
 	switch wc.BlobSource.Scheme {
 	case "file": // Indicates that the registry's storage is mounted locally
 		return path.Join(wc.BlobSource.Path, "docker/registry/v2/blobs/")
@@ -188,17 +191,48 @@ func (wc *watchClient) getBlobPath(branch string) string {
 	return ""
 }
 
+//Update an image reference to point to a new digest
+func (wc *watchClient) updateRef(imgref, digest string) error {
+	//TODO: locking
+	file, err := os.OpenFile(path.Join(wc.OSTreeConfig.BasePath, "images", imgref, "link"), os.O_CREATE, 0744)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte(digest)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Given a branch and digest, explode that digest into the branch
 // and check it out in a predictable way. Finally, update the tag
 // reference
-func (wc *watchClient) explode(branch, digest string) {
+func (wc *watchClient) explode(imgref, digest string) {
 	// TODO: Lock this branch ref while we are editing it
 	repo := wc.OSTreeConfig.FullPath
+	checkoutpath := path.Join(wc.OSTreeConfig.BasePath, "digest", strings.Join(strings.Split(digest, ":"), "/"), "rootfs")
 
 	ctxLogger := log.WithFields(log.Fields{
-		"branch": branch,
+		"ref":    imgref,
 		"digest": digest,
 	})
+
+	// Check if the image exists already on the disk
+	// This could lead to collisions, but that risk is already
+	// existent and inherent in docker
+	if _, err := os.Open(checkoutpath); err == nil { // File exists
+		ctxLogger.Warn("Image already exists.")
+		if err := wc.updateRef(imgref, digest); err != nil {
+			ctxLogger.WithField("err", err).Error("Could not update reference")
+		}
+		return
+	}
 
 	img, err := wc.Client.Images().Get(digest)
 	if err != nil {
@@ -206,53 +240,74 @@ func (wc *watchClient) explode(branch, digest string) {
 		return
 	}
 
-	tmp, err := ioutil.TempDir("", "img")
-	if err != nil {
-		ctxLogger.Errorf("Could not create temp dir")
-		return
-	}
-	defer os.RemoveAll(tmp)
+	blobstore := wc.getBlobPath()
+	os.MkdirAll(path.Dir(checkoutpath), 0755)
 
 	layers := img.DockerImageLayers
 	// Have to iterate over this backwards for some reason
+	// But it's still cleaner than parsing DockerImageManifest
 	for i := len(layers) - 1; i >= 0; i-- {
 		blob := layers[i].Name
-		blobstore := wc.getBlobPath(branch)
 		comp := strings.SplitN(blob, ":", 2)
-		// TODO: This disgusts me
+		// TODO: ugh
 		blobpath := strings.Join(comp, "/"+comp[1][:2]+"/")
 		blobpath = path.Join(blobstore, blobpath, "data")
 
-		err := archive.UntarPath(blobpath, tmp)
+		commitCfg := ostree.NewCommitOptions()
+		commitCfg.Subject = blob
+		commitCfg.Tree = []string{"tar=" + blobpath}
+		commitCfg.TarAutoCreateParents = true
+		log.Debugf("Len: %s %s", len(commitCfg.Tree), len(commitCfg.Tree[0]))
+		commit, err := ostree.Commit(repo, "", digest, commitCfg)
 		if err != nil {
-			ctxLogger.WithField("blob", blobpath).Errorf("Could not unpack blob")
+			ctxLogger.WithField("blob", blob).Error("Failed to commit (IMAGE POISONED)")
 			return
+		} /*
+			cmd := exec.Command("/usr/bin/ostree",
+				"commit",
+				"--repo="+repo,
+				"--subject="+blob,
+				"--tree=tar="+blobpath,
+				"--branch="+digest)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				ctxLogger.WithFields(log.Fields{
+					"blob": blob,
+					"err": err,
+				}).Error("Could not commit (POISONED)")
+				return
+			}
+			cpipe, err := cmd.StdoutPipe()
+			if err != nil {
+				ctxLogger.Error("Could not get command result")
+				return
+			}
+			var commitslc []byte
+			commitslc = make([]byte, 64)
+			if _, err := cpipe.Read(commitslc); err != nil {
+				ctxLogger.Error("Could not read command result")
+			}
+			commit := string(commitslc)
+			// END HACK */
+
+		checkoutOpts := ostree.NewCheckoutOptions()
+		checkoutOpts.Union = true
+		checkoutOpts.Whiteouts = true
+		if err := ostree.Checkout(repo, checkoutpath, commit, checkoutOpts); err != nil {
+			ctxLogger.WithFields(log.Fields{
+				"commit": commit,
+				"path":   checkoutpath,
+				"err":    err,
+			}).Error("Could not checkout layer")
 		}
 	}
 
-	// Commit tmp to OSTree
-	commitCfg := ostree.NewCommitOptions()
-	commitCfg.Subject = digest
-	commit, err := ostree.Commit(repo, tmp, branch, commitCfg)
-	if err != nil {
-		ctxLogger.WithField("dir", tmp).Error("Error commiting to OSTree")
-		return
-	}
-
-	// Check the commit out into the images directory
-	checkoutpath := path.Join(wc.OSTreeConfig.BasePath, "images", strings.Join(strings.Split(digest, ":"), "/"))
-	os.MkdirAll(path.Dir(checkoutpath), 0755)
-	if err := ostree.Checkout(repo, checkoutpath, commit, ostree.NewCheckoutOptions()); err != nil {
-		ctxLogger.WithFields(log.Fields{
-			"commit": commit,
-			"path":   checkoutpath,
-			"err":    err,
-		}).Error("Could not checkout commit")
-		return
-	}
-
 	// Update the ref
-	// TODO: update the ref
+	if err := wc.updateRef(imgref, digest); err != nil {
+		ctxLogger.WithField("err", err).Error("Could not update reference")
+		return
+	}
+	ctxLogger.Info("Exploded")
 }
 
 // handle an ADDED image
@@ -268,26 +323,61 @@ func (wc *watchClient) imageAdded(is *imageapi.ImageStream) {
 	}
 
 	for tag, events := range tags {
-		branch := getBranch(is, tag)
+		imgref := getFullRef(is, tag)
 		digest := events.Items[0].Image
 
-		curdigest := wc.digestForBranch(branch)
+		curdigest := wc.digestForRef(imgref)
 
 		if digest != curdigest {
-			go wc.explode(branch, digest)
-			ctxLogger.WithField("tag", tag).Info("Updated tag")
+			go wc.explode(imgref, digest)
+			ctxLogger.WithField("tag", tag).Info("New tag")
 		}
 	}
 }
 
 // Handle an UPDATED image
 func (wc *watchClient) imageUpdated(is *imageapi.ImageStream) {
-	println(is.Status.DockerImageRepository)
+	ctxLogger := log.WithFields(log.Fields{
+		"eventType": "UPDATED",
+		"image":     is.Status.DockerImageRepository,
+	})
+
+	tags := is.Status.Tags
+	if tags == nil {
+		ctxLogger.Error("No tags.")
+		return
+	}
+
+	for tag, events := range tags {
+		// Compare current digest for tag with new
+		imgref := getFullRef(is, tag)
+		digest := events.Items[0].Image
+
+		curdigest := wc.digestForRef(imgref)
+
+		if digest != curdigest {
+			go wc.explode(imgref, digest)
+			ctxLogger.WithFields(log.Fields{
+				"tag": tag,
+			}).Info("Updated tag")
+		}
+	}
 }
 
 // Handle a DELETED image
 func (wc *watchClient) imageDeleted(is *imageapi.ImageStream) {
-	println(is.Status.DockerImageRepository)
+	ctxLogger := log.WithFields(log.Fields{
+		"eventType": "DELETED",
+		"image":     is.Status.DockerImageRepository,
+	})
+
+	tags := is.Status.Tags
+	if tags == nil {
+		ctxLogger.Error("No tags (???)")
+		return
+	}
+
+	//TODO: Process a Deleted image's tags for removal
 }
 
 // Test that we have appropriate privilege for a given client and namespace,
