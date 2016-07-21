@@ -45,6 +45,8 @@ The OSTree object repository will be created at '.repo/' within this
 directory.
 `
 
+const digestLen = 71
+
 func init() {
 	log.SetOutput(os.Stderr)
 	log.SetLevel(log.DebugLevel)
@@ -170,11 +172,11 @@ func (wc *watchClient) digestForRef(imgref string) string {
 	defer file.Close()
 
 	var digest []byte
-	digest = make([]byte, 72)
+	digest = make([]byte, digestLen)
 	if n, err := file.Read(digest); err != nil {
 		log.WithField("imgref", imgref).Error("Could not read ref")
-	} else if n != 72 {
-		log.Warn("Digest read unexpected length")
+	} else if n != digestLen {
+		log.WithField("len", n).Debug("Digest read unexpected length")
 	}
 	return string(digest)
 }
@@ -194,7 +196,9 @@ func (wc *watchClient) getBlobPath() string {
 //Update an image reference to point to a new digest
 func (wc *watchClient) updateRef(imgref, digest string) error {
 	//TODO: locking
-	file, err := os.OpenFile(path.Join(wc.OSTreeConfig.BasePath, "images", imgref, "link"), os.O_CREATE, 0744)
+	lpath := path.Join(wc.OSTreeConfig.BasePath, "images", imgref, "link")
+	os.MkdirAll(path.Dir(lpath), 0755)
+	file, err := os.OpenFile(lpath, os.O_CREATE+os.O_RDWR, 0744)
 	if err != nil {
 		return err
 	}
@@ -241,13 +245,14 @@ func (wc *watchClient) explode(imgref, digest string) {
 	}
 
 	blobstore := wc.getBlobPath()
+	branch := "oci/" + strings.Join(strings.SplitN(digest, ":", 2), "/")
 	os.MkdirAll(path.Dir(checkoutpath), 0755)
 
+	lastCommit := "none"
+
 	layers := img.DockerImageLayers
-	// Have to iterate over this backwards for some reason
-	// But it's still cleaner than parsing DockerImageManifest
-	for i := len(layers) - 1; i >= 0; i-- {
-		blob := layers[i].Name
+	for _, layer := range layers {
+		blob := layer.Name
 		comp := strings.SplitN(blob, ":", 2)
 		// TODO: ugh
 		blobpath := strings.Join(comp, "/"+comp[1][:2]+"/")
@@ -257,38 +262,18 @@ func (wc *watchClient) explode(imgref, digest string) {
 		commitCfg.Subject = blob
 		commitCfg.Tree = []string{"tar=" + blobpath}
 		commitCfg.TarAutoCreateParents = true
-		log.Debugf("Len: %s %s", len(commitCfg.Tree), len(commitCfg.Tree[0]))
-		commit, err := ostree.Commit(repo, "", digest, commitCfg)
+		commitCfg.Parent = lastCommit
+		commit, err := ostree.Commit(repo, "", branch, commitCfg)
 		if err != nil {
-			ctxLogger.WithField("blob", blob).Error("Failed to commit (IMAGE POISONED)")
+			ctxLogger.WithFields(log.Fields{
+				"blob":   blob,
+				"branch": branch,
+				"err":    err,
+			}).Error("Failed to commit (IMAGE POISONED)")
 			return
-		} /*
-			cmd := exec.Command("/usr/bin/ostree",
-				"commit",
-				"--repo="+repo,
-				"--subject="+blob,
-				"--tree=tar="+blobpath,
-				"--branch="+digest)
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				ctxLogger.WithFields(log.Fields{
-					"blob": blob,
-					"err": err,
-				}).Error("Could not commit (POISONED)")
-				return
-			}
-			cpipe, err := cmd.StdoutPipe()
-			if err != nil {
-				ctxLogger.Error("Could not get command result")
-				return
-			}
-			var commitslc []byte
-			commitslc = make([]byte, 64)
-			if _, err := cpipe.Read(commitslc); err != nil {
-				ctxLogger.Error("Could not read command result")
-			}
-			commit := string(commitslc)
-			// END HACK */
+		}
+
+		lastCommit = commit
 
 		checkoutOpts := ostree.NewCheckoutOptions()
 		checkoutOpts.Union = true
@@ -298,7 +283,8 @@ func (wc *watchClient) explode(imgref, digest string) {
 				"commit": commit,
 				"path":   checkoutpath,
 				"err":    err,
-			}).Error("Could not checkout layer")
+			}).Error("Could not checkout layer (IMAGE POISONED)")
+			return
 		}
 	}
 
@@ -378,6 +364,21 @@ func (wc *watchClient) imageDeleted(is *imageapi.ImageStream) {
 	}
 
 	//TODO: Process a Deleted image's tags for removal
+	for tag, events := range tags {
+		for _, event := range events.Items {
+			// TODO: locking, refcounting
+			imgpath := path.Join(wc.OSTreeConfig.BasePath, "digest")
+			imgpath = path.Join(imgpath, strings.Join(strings.SplitN(event.Image, ":", 2), "/"))
+			if err := os.RemoveAll(imgpath); err != nil {
+				ctxLogger.WithField("path", imgpath).Error("Failed to delete image")
+			}
+		}
+		// TODO: locking
+		refpath := path.Join(wc.OSTreeConfig.BasePath, "images", getFullRef(is, tag))
+		if err := os.RemoveAll(refpath); err != nil {
+			ctxLogger.WithField("path", refpath).Error("Failed to delete reference")
+		}
+	}
 }
 
 // Test that we have appropriate privilege for a given client and namespace,
