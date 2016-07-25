@@ -1,5 +1,9 @@
 #!/bin/bash
 #
+# This file is a part of https://github.com/feedhenry/openshift-template-tool
+# and is licensed under the terms of the Apache License v2.0
+# (https://raw.githubusercontent.com/feedhenry/openshift-template-tool/master/LICENSE)
+#
 # This script copies dependencies from openshift/origin into the vendor
 # directory. We need to use such custom method because no other existing tool
 # would allow us to get the OpenShift dependencies as they are, including

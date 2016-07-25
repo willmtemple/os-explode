@@ -31,21 +31,47 @@ This program takes no arguments. Instead, it accepts several environment
 variables.
 
 API CONFIG:
-Set OS_API_BASEURL to the URL of the OpenShift API (e.g.
-'https://localhost:8443/oapi/v1/'). Set OS_API_TOKEN to a token for API
-access.
+Set KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT to the hostname
+and port (respectively) of the Kubernetes API. The program will attempt
+to read a token from /var/run/secrets/kubernetes.io/serviceaccount, but
+this behavior may be overridden by the KUBERNETES_SERVICE_TOKEN
+environment variable.
 
 Optionally set OS_WATCH_NAMESPACE to a particular project to restrict the
 watch scope to that project. This will be necessary if you don't have
 permission to watch ImageStreams or list images at the cluster scope.
 
+Optionally set OS_WATCH_INSECURE to "true" to indicate that the REST
+client should not perform certificate validation.
+
+BLOB SOURCE:
+Optionally set OS_IMAGE_BLOB_SOURCE to a URL. If the URL has the file://
+scheme, it will be treated as a local registry storage. If the URL has the
+https:// scheme, it will be treated as a remote docker registry. If unset,
+this value will default to "file:///registry/"
+
 STORAGE CONFIG:
-Set OS_WATCH_REPO to the location of the OSTree repo (e.g. /var/explode).
+Set OSTREE_REPO_PATH to the location of the OSTree repo (e.g. /var/explode).
 The OSTree object repository will be created at '.repo/' within this
 directory.
 `
 
 const digestLen = 71
+
+const k8sServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount"
+const k8sServiceAccountTokenEnv = "KUBERNETES_SERVICE_TOKEN"
+const k8sServiceHostEnv = "KUBERNETES_SERVICE_HOST"
+const k8sServicePortEnv = "KUBERNETES_SERVICE_PORT"
+const osNamespaceEnv = "OS_WATCH_NAMESPACE"
+const repoPathEnv = "OSTREE_REPO_PATH"
+const blobSourceEnv = "OS_IMAGE_BLOB_SOURCE"
+const apiInsecureEnv = "OS_WATCH_INSECURE"
+
+// RepoSubDir describes the subpath of an OSTree repo in a compliant image store
+const RepoSubDir = ".repo"
+
+// DefaultBlobStore describes the default storage for a docker registry
+const DefaultBlobStore = "file:///registry/"
 
 func init() {
 	log.SetOutput(os.Stderr)
@@ -87,14 +113,70 @@ type watchClient struct {
 	BlobSource   *url.URL
 }
 
-// Create a new watcher
-func newWatchClient(baseurl, token, namespace, basedir string) (*watchClient, error) {
-	//TODO: Add a way to configure these values
-	insecure := true
-	repodir := ".repo/"
-	blobsource, err := url.Parse("file:///registry/")
+// Gets a token from the k8s pod filesystem
+func getTokenFromPod() (string, error) {
+	f, err := os.Open(k8sServiceAccountTokenPath)
 	if err != nil {
-		log.WithField("err", err).Fatal("Couldn't parse BlobSource")
+		return "", err
+	}
+	defer f.Close()
+
+	var token []byte
+	token = make([]byte, 4096) //TODO: size this
+	n, err := f.Read(token)
+	if err != nil {
+		return "", err
+	}
+	log.WithField("size", n).Debug("Read token")
+	return string(token), nil
+}
+
+// Create a new watcher
+func newWatchClient() (*watchClient, error) {
+	//TODO: This function got a little out of hand
+	var err error
+
+	host := os.Getenv(k8sServiceHostEnv)
+	port := os.Getenv(k8sServicePortEnv)
+
+	baseurl := "https://" + host + ":" + port
+
+	var namespace string
+	if namespace = os.Getenv(osNamespaceEnv); namespace == "" {
+		namespace = kapi.NamespaceAll
+	}
+
+	basedir := os.Getenv(repoPathEnv)
+
+	// Whether or not the client should validate with CA
+	insecure := os.Getenv(apiInsecureEnv) == "true"
+
+	// Source of our layer tars
+	var blobsource *url.URL
+	if bsraw := os.Getenv(blobSourceEnv); bsraw != "" {
+		blobsource, err = url.Parse(bsraw)
+		if err != nil {
+			log.WithField("err", err).Fatalf("Couldn't parse %s=%s", blobSourceEnv, bsraw)
+		}
+	} else {
+		blobsource, _ = url.Parse(DefaultBlobStore)
+	}
+
+	ctxLogger := log.WithFields(log.Fields{
+		"repo":       path.Join(basedir, RepoSubDir),
+		"blobsource": blobsource.String(),
+		"insecure":   insecure,
+		"namespace":  namespace,
+		"url":        baseurl,
+	})
+	ctxLogger.Debug("Client info gathered.")
+
+	var token string
+	if token = os.Getenv(k8sServiceAccountTokenEnv); token == "" {
+		token, err = getTokenFromPod()
+		if err != nil {
+			ctxLogger.Fatal("No available token.")
+		}
 	}
 
 	c, err := client.New(&restclient.Config{
@@ -108,15 +190,10 @@ func newWatchClient(baseurl, token, namespace, basedir string) (*watchClient, er
 
 	wc := &watchClient{
 		Client: c,
-		Logger: log.WithFields(log.Fields{
-			"baseurl":     baseurl,
-			"insecure":    insecure,
-			"reposubpath": repodir,
-			"namespace":   namespace,
-		}),
+		Logger: ctxLogger,
 		Namespace: namespace,
 		OSTreeConfig: ostreeConfig{
-			FullPath: path.Join(basedir, repodir),
+			FullPath: path.Join(basedir, RepoSubDir),
 			BasePath: basedir,
 		},
 		BlobSource: blobsource,
@@ -125,29 +202,9 @@ func newWatchClient(baseurl, token, namespace, basedir string) (*watchClient, er
 }
 
 func main() {
-	var baseurl, token, namespace, repodir string
-
-	// TODO: get this info from k8s pod environment
-	baseurl = os.Getenv("OS_API_BASEURL")
-	token = os.Getenv("OS_API_TOKEN")
-	namespace = os.Getenv("OS_WATCH_NAMESPACE")
-	repodir = os.Getenv("OS_WATCH_REPO")
-
-	if baseurl == "" || token == "" || repodir == "" {
-		fmt.Fprint(os.Stderr, programUsage)
-		os.Exit(1)
-	}
-
-	if namespace == "" {
-		namespace = kapi.NamespaceAll
-	}
-
-	client, err := newWatchClient(baseurl, token, namespace, repodir)
+	client, err := newWatchClient()
 	if err != nil {
-		log.WithFields(log.Fields{
-			"host": baseurl,
-			"err":  err,
-		}).Fatal("Could not create watch client.")
+		log.WithField("err", err).Fatal("Could not create watch client.")
 	}
 
 	if err := client.OSTreeConfig.initRepo(); err != nil {
@@ -175,6 +232,7 @@ func (wc *watchClient) digestForRef(imgref string) string {
 	digest = make([]byte, digestLen)
 	if n, err := file.Read(digest); err != nil {
 		log.WithField("imgref", imgref).Error("Could not read ref")
+		return ""
 	} else if n != digestLen {
 		log.WithField("len", n).Debug("Digest read unexpected length")
 	}
@@ -248,7 +306,7 @@ func (wc *watchClient) explode(imgref, digest string) {
 	branch := "oci/" + strings.Join(strings.SplitN(digest, ":", 2), "/")
 	os.MkdirAll(path.Dir(checkoutpath), 0755)
 
-	lastCommit := "none"
+	//lastCommit := "none"
 
 	layers := img.DockerImageLayers
 	for _, layer := range layers {
@@ -262,7 +320,7 @@ func (wc *watchClient) explode(imgref, digest string) {
 		commitCfg.Subject = blob
 		commitCfg.Tree = []string{"tar=" + blobpath}
 		commitCfg.TarAutoCreateParents = true
-		commitCfg.Parent = lastCommit
+		//commitCfg.Parent = lastCommit
 		commit, err := ostree.Commit(repo, "", branch, commitCfg)
 		if err != nil {
 			ctxLogger.WithFields(log.Fields{
@@ -273,7 +331,7 @@ func (wc *watchClient) explode(imgref, digest string) {
 			return
 		}
 
-		lastCommit = commit
+		//lastCommit = commit
 
 		checkoutOpts := ostree.NewCheckoutOptions()
 		checkoutOpts.Union = true
@@ -367,16 +425,27 @@ func (wc *watchClient) imageDeleted(is *imageapi.ImageStream) {
 	for tag, events := range tags {
 		for _, event := range events.Items {
 			// TODO: locking, refcounting
-			imgpath := path.Join(wc.OSTreeConfig.BasePath, "digest")
-			imgpath = path.Join(imgpath, strings.Join(strings.SplitN(event.Image, ":", 2), "/"))
+			basepath := path.Join(wc.OSTreeConfig.BasePath, "digest")
+			imgpath := path.Join(basepath, strings.Join(strings.SplitN(event.Image, ":", 2), "/"))
 			if err := os.RemoveAll(imgpath); err != nil {
 				ctxLogger.WithField("path", imgpath).Error("Failed to delete image")
 			}
+			dir := path.Dir(imgpath)
+			for dir != basepath {
+				os.Remove(dir)
+				dir = path.Dir(dir)
+			}
 		}
 		// TODO: locking
-		refpath := path.Join(wc.OSTreeConfig.BasePath, "images", getFullRef(is, tag))
+		basepath := path.Join(wc.OSTreeConfig.BasePath, "images")
+		refpath := path.Join(basepath, getFullRef(is, tag))
 		if err := os.RemoveAll(refpath); err != nil {
 			ctxLogger.WithField("path", refpath).Error("Failed to delete reference")
+		}
+		dir := path.Dir(refpath)
+		for dir != basepath {
+			os.Remove(dir)
+			dir = path.Dir(dir)
 		}
 	}
 }
