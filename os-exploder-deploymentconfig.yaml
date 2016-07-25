@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: DeploymentConfig
+metadata:
+  name: docker-exploder
+spec:
+  strategy:
+    type: Recreate
+    recreateParams:
+      timeoutSeconds: 600
+    resources:
+  triggers:
+    -
+      type: ConfigChange
+  replicas: 1
+  test: false
+  selector:
+    docker-exploder: default
+  template:
+    metadata:
+      name: docker-exploder
+      creationTimestamp: null
+      labels:
+        docker-exploder: default
+    spec:
+      volumes:
+        -
+          name: registry-storage
+          hostPath:
+            path: /registry
+        -
+          name: explode-storage
+          hostPath:
+            path: /explode
+      containers:
+       -
+          name: exploder
+          image: exploder
+          env:
+            -
+              name: OS_WATCH_INSECURE
+              value: 'true'
+          resources:
+          volumeMounts:
+            -
+              name: registry-storage
+              mountPath: /registry
+            -
+              name: explode-storage
+              mountPath: /explode
+          terminationMessagePath: /dev/termination-log
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+      serviceAccountName: exploder
+      serviceAccount: exploder
+      securityContext:
