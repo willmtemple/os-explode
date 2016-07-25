@@ -1,0 +1,21 @@
+kind: DeploymentConfig
+apiVersion: "v1"
+metadata:
+  name: "os-exploder"
+spec:
+  template:
+    metadata:
+      labels:
+        name: "os-exploder"
+    spec:
+      containers:
+        - name: "os-exploder"
+          image: "os-exploder"
+      serviceAccount: "os-exploder"
+  replicas: 1
+  selector:
+    name: "os-exploder"
+  triggers:
+    -type: "ConfigChange"
+  strategy:
+    type: "Recreate"
