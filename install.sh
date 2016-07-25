@@ -6,9 +6,9 @@ IFS=$'\n\t'
 docker build -t os-exploder .
 
 # start kubernetes service account
-kubectl create -f os-exploder-sa.yaml
+co create -f os-exploder-serviceaccount.yaml
 
 # start k8s pod with the api token for the above service account
-kubectl create -f os-exploder-pod.yaml
+oc create -f os-exploder-deploymentconfig.yaml
 
 oadm policy add-scc-to-user privileged system:serviceaccounts:default:os-exploder

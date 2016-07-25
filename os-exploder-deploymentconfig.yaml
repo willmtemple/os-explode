@@ -9,13 +9,13 @@ spec:
         name: "os-exploder"
     spec:
       containers:
-        - name: "os-exploder"
-          image: "os-exploder"
+      - name: "os-exploder"
+        image: "os-exploder"
       serviceAccount: "os-exploder"
   replicas: 1
   selector:
     name: "os-exploder"
   triggers:
-    -type: "ConfigChange"
+  - type: "ConfigChange"
   strategy:
     type: "Recreate"

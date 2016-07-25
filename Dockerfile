@@ -3,6 +3,6 @@ LABEL Description="This image is used to watch for changes in a registry explode
 
 ADD ./exploder /
 
-# EXPOSE ?
+CMD yum install ostree-devel
 
 ENTRYPOINT ["/exploder"]
