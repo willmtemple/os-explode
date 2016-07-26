@@ -41,15 +41,18 @@ the following variables:
 |------------------------------|-----------------------------------------------------------------------------------------|--------------------------------------|
 | KUBERNETES_SERVICE_HOST | OpenShift API Host | Kubernetes, otherwise *required* |
 | KUBERNETES_SERVICE_PORT | OpenShift API Port | Kubernetes, otherwise *required* |
-| KUBERNETES_SERVICE_TOKEN | OpenShift API Bearer Token | Kubernetes, otherwise *required* |
+| KUBERNETES_SERVICE_TOKEN | OpenShift API Bearer Token | Kubernetes, otherwise *required*[1] |
 | OS_WATCH_NAMESPACE | Restrict watch to a specific namespace | Default to "" (all) |
 | OS_WATCH_INSECURE | If "true", don't validate certificates for API transport | Default to "false" |
 | OSTREE_REPO_PATH | Path the OSTree repo for exploded images. | Default to "/explode" |
 | OS_IMAGE_BLOB_SOURCE | URL to the docker layer "blob" storage, currently only the file:// scheme is supported. | Default to "file:///registry" |
-| DOCKER_REGISTRY_SERVICE_HOST | OpenShift integrated docker registry host | OpenShift, othwerwise *optional* [1] |
-| DOCKER_REGISTRY_SERVICE_PORT | OpenShift integrated docker registry port | OpenShift, otherwise *optional* [1] |
+| DOCKER_REGISTRY_SERVICE_HOST | OpenShift integrated docker registry host | OpenShift, othwerwise *optional* [2] |
+| DOCKER_REGISTRY_SERVICE_PORT | OpenShift integrated docker registry port | OpenShift, otherwise *optional* [2] |
 
-- [1] The Docker registry host/port is used to determine if an image can be
+- [1] If this environment variable is not specified, Kubernetes provides the
+  token as `/var/run/secrets/kubernetes.io/serviceaccount/token`. If the
+  variable is provided, it will be taken to be the token *value*
+- [2] The Docker registry host/port is used to determine if an image can be
   exploded. In many cases, ImageStreams may refer to external images, and the
   integrated registry can "pullthrough" these images. If an ImageStream's
   Docker Image pull reference doesn't match the configured registry host/port,
@@ -57,7 +60,8 @@ the following variables:
 
 ## License
 
-![GNU Affero GPL v3](https://www.gnu.org/graphics/agplv3-155x51.png "GNU Affero GPL v3")
+[![GNU Affero GPL v3](https://www.gnu.org/graphics/agplv3-155x51.png "GNU Affero GPL v3")](https://www.gnu.org/licenses/agpl-3.0.en.html)
 
 This program is distributed under the terms of the GNU Affero General Public
-License version 3.
+License version 3.0. Included scripts and vendored sources (code in the
+`vendor/` directory) may be provided under their own, separate licenses.
