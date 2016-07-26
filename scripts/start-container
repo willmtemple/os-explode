@@ -1,0 +1,16 @@
+#!/bin/bash -x
+set -euo pipefail
+IFS=$'\n\t'
+
+IMAGE_REPO=${IMAGE_REPO:-/mnt}
+
+mkdir -p workdir upperdir rootfs
+
+DIGEST=`cat ${IMAGE_REPO}/images/$1/link`
+DIGEST=`sed -e "s/:/\//" <<< ${DIGEST}`
+
+sudo mount -t overlay overlay -olowerdir=${IMAGE_REPO}/digest/${DIGEST}/rootfs,workdir=$PWD/workdir,upperdir=$PWD/upperdir,rw $PWD/rootfs
+
+runc spec
+
+sudo `which runc` run test

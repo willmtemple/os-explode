@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/url"
 	"os"
 	"path"
@@ -53,12 +54,12 @@ this value will default to "file:///registry/"
 STORAGE CONFIG:
 Set OSTREE_REPO_PATH to the location of the OSTree repo (e.g. /var/explode).
 The OSTree object repository will be created at '.repo/' within this
-directory.
+directory. If this value is not specified, it will default to "/explode/".
 `
 
 const digestLen = 71
 
-const k8sServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount"
+const k8sServiceAccountSecretPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 const k8sServiceAccountTokenEnv = "KUBERNETES_SERVICE_TOKEN"
 const k8sServiceHostEnv = "KUBERNETES_SERVICE_HOST"
 const k8sServicePortEnv = "KUBERNETES_SERVICE_PORT"
@@ -66,6 +67,8 @@ const osNamespaceEnv = "OS_WATCH_NAMESPACE"
 const repoPathEnv = "OSTREE_REPO_PATH"
 const blobSourceEnv = "OS_IMAGE_BLOB_SOURCE"
 const apiInsecureEnv = "OS_WATCH_INSECURE"
+const dockerRegistryServiceHostEnv = "DOCKER_REGISTRY_SERVICE_HOST"
+const dockerRegistryServicePortEnv = "DOCKER_REGISTRY_SERVICE_PORT"
 
 // RepoSubDir describes the subpath of an OSTree repo in a compliant image store
 const RepoSubDir = ".repo"
@@ -73,9 +76,11 @@ const RepoSubDir = ".repo"
 // DefaultBlobStore describes the default storage for a docker registry
 const DefaultBlobStore = "file:///registry/"
 
+const defaultRepoPath = "/explode/"
+
 func init() {
 	log.SetOutput(os.Stderr)
-	log.SetLevel(log.DebugLevel)
+	log.SetLevel(log.InfoLevel)
 }
 
 // Configuration for the OSTree Repository
@@ -111,24 +116,16 @@ type watchClient struct {
 	Namespace    string
 	OSTreeConfig ostreeConfig
 	BlobSource   *url.URL
+	Registry     string
 }
 
 // Gets a token from the k8s pod filesystem
 func getTokenFromPod() (string, error) {
-	f, err := os.Open(k8sServiceAccountTokenPath)
+	tok, err := ioutil.ReadFile(path.Join(k8sServiceAccountSecretPath, "token"))
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-
-	var token []byte
-	token = make([]byte, 4096) //TODO: size this
-	n, err := f.Read(token)
-	if err != nil {
-		return "", err
-	}
-	log.WithField("size", n).Debug("Read token")
-	return string(token), nil
+	return string(tok), nil
 }
 
 // Create a new watcher
@@ -147,6 +144,9 @@ func newWatchClient() (*watchClient, error) {
 	}
 
 	basedir := os.Getenv(repoPathEnv)
+	if basedir == "" {
+		basedir = defaultRepoPath
+	}
 
 	// Whether or not the client should validate with CA
 	insecure := os.Getenv(apiInsecureEnv) == "true"
@@ -162,12 +162,15 @@ func newWatchClient() (*watchClient, error) {
 		blobsource, _ = url.Parse(DefaultBlobStore)
 	}
 
+	dockerregistry := os.Getenv(dockerRegistryServiceHostEnv) + ":" + os.Getenv(dockerRegistryServicePortEnv)
+
 	ctxLogger := log.WithFields(log.Fields{
 		"repo":       path.Join(basedir, RepoSubDir),
 		"blobsource": blobsource.String(),
 		"insecure":   insecure,
 		"namespace":  namespace,
 		"url":        baseurl,
+		"registry":   dockerregistry,
 	})
 	ctxLogger.Debug("Client info gathered.")
 
@@ -179,6 +182,8 @@ func newWatchClient() (*watchClient, error) {
 		}
 	}
 
+	log.WithField("tok", token).Debug("Have my token.")
+
 	c, err := client.New(&restclient.Config{
 		Host:        baseurl,
 		BearerToken: token,
@@ -189,14 +194,15 @@ func newWatchClient() (*watchClient, error) {
 	}
 
 	wc := &watchClient{
-		Client: c,
-		Logger: ctxLogger,
+		Client:    c,
+		Logger:    ctxLogger,
 		Namespace: namespace,
 		OSTreeConfig: ostreeConfig{
 			FullPath: path.Join(basedir, RepoSubDir),
 			BasePath: basedir,
 		},
 		BlobSource: blobsource,
+		Registry: dockerregistry,
 	}
 	return wc, nil
 }
@@ -320,7 +326,8 @@ func (wc *watchClient) explode(imgref, digest string) {
 		commitCfg.Subject = blob
 		commitCfg.Tree = []string{"tar=" + blobpath}
 		commitCfg.TarAutoCreateParents = true
-		//commitCfg.Parent = lastCommit
+		//commitCfg.Parent = lastCommit TODO: This should be fixed at some point
+		commitCfg.Fsync = false
 		commit, err := ostree.Commit(repo, "", branch, commitCfg)
 		if err != nil {
 			ctxLogger.WithFields(log.Fields{
@@ -354,6 +361,11 @@ func (wc *watchClient) explode(imgref, digest string) {
 	ctxLogger.Info("Exploded")
 }
 
+// Determine if an image is a Pullthrough ref
+func (wc *watchClient) isPullthrough(ref string) bool {
+	return !strings.HasPrefix(ref, wc.Registry + "/")
+}
+
 // handle an ADDED image
 func (wc *watchClient) imageAdded(is *imageapi.ImageStream) {
 	ctxLogger := log.WithFields(log.Fields{
@@ -369,6 +381,11 @@ func (wc *watchClient) imageAdded(is *imageapi.ImageStream) {
 	for tag, events := range tags {
 		imgref := getFullRef(is, tag)
 		digest := events.Items[0].Image
+
+		if wc.isPullthrough(events.Items[0].DockerImageReference) {
+			ctxLogger.WithField("tag", imgref).Debug("Ignoring pullthrough.")
+			continue
+		}
 
 		curdigest := wc.digestForRef(imgref)
 
@@ -396,6 +413,11 @@ func (wc *watchClient) imageUpdated(is *imageapi.ImageStream) {
 		// Compare current digest for tag with new
 		imgref := getFullRef(is, tag)
 		digest := events.Items[0].Image
+
+		if wc.isPullthrough(events.Items[0].DockerImageReference) {
+			ctxLogger.WithField("tag", imgref).Debug("Ignoring pullthrough.")
+			continue
+		}
 
 		curdigest := wc.digestForRef(imgref)
 
@@ -481,7 +503,7 @@ func (wc *watchClient) watchImageStreams() {
 			},
 		},
 		&imageapi.ImageStream{},
-		2*time.Minute,
+		10*time.Minute, // TODO: Understand the implications of different settings for this number.
 		framework.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				wc.Logger.Debug("Image ADDED")
