@@ -3,6 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # Build the docker image
+<<<<<<< HEAD
 docker build -t exploder .
 
 # start kubernetes service account
