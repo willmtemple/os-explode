@@ -34,7 +34,7 @@ spec:
       containers:
        -
           name: exploder
-          image: test-image
+          image: exploder
           env:
             -
               name: OS_WATCH_INSECURE
