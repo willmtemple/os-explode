@@ -1,8 +1,8 @@
-FROM openshift/origin-base
+FROM fedora:24
 LABEL Description="This image is used to watch for changes in a registry explode new images onto a persistent volume" Version="0.1"
 
 ADD ./exploder /
 
-RUN yum install -y ostree
+RUN dnf install -y ostree
 
 ENTRYPOINT ["/exploder"]
