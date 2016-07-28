@@ -24,7 +24,7 @@ import (
 
 	_ "github.com/openshift/origin/pkg/image/api/install"
 
-  "github.com/14rcole/os-explode/pkg/watchclient"
+  "github.com/willmtemple/os-explode/pkg/watchclient"
 )
 
 const programUsage = `os-watcher - watch OpenShift v3 API for changes

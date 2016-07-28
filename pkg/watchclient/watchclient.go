@@ -30,7 +30,7 @@
    kapi "k8s.io/kubernetes/pkg/api"
    "k8s.io/kubernetes/pkg/client/restclient"
 
-   "github.com/14rcole/os-explode/pkg/ostreeconfig"
+   "github.com/willmtemple/os-explode/pkg/ostreeconfig"
  )
 
 const k8sServiceAccountSecretPath = "/var/run/secrets/kubernetes.io/serviceaccount"
