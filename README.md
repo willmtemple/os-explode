@@ -22,7 +22,15 @@ The program can be run as a standalone executable, in a docker container, or
 in an OpenShift pod.
 
 OpenShift/Kubernetes YAML files have been provided in the `kube/` directory. To
-configure a quick deployment, run the `install.sh` script.
+configure a quick deployment, run the following commands.
+
+```
+oc create serviceaccount exploder
+oc new-app -f templates/exploder-openshift.yaml
+oadm policy add-scc-to-user privileged system:serviceaccount:default:exploder
+```
+
+[See below](#configuration) for optional parameters.
 
 ### Requirements
 
