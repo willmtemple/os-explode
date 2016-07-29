@@ -18,6 +18,7 @@
 package ostreeconfig
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -34,6 +35,13 @@ type OstreeConfig struct {
 
 // Create a new OstreeConfig
 func (otc *OstreeConfig) InitRepo() error {
+	if otc.BasePath == "" {
+		return errors.New("BasePath must not be empty")
+	}
+	if otc.FullPath == "" {
+		return errors.New("FullPath must not be empty")
+	}
+
 	if err := os.MkdirAll(otc.BasePath, 0755); err != nil {
 		return err
 	}
