@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package framework
 
 import (
 	"fmt"
-	"reflect"
 	"sync"
 	"time"
 
@@ -67,12 +66,11 @@ func NewSharedInformer(lw cache.ListerWatcher, objType runtime.Object, resyncPer
 // be shared amongst all consumers.
 func NewSharedIndexInformer(lw cache.ListerWatcher, objType runtime.Object, resyncPeriod time.Duration, indexers cache.Indexers) SharedIndexInformer {
 	sharedIndexInformer := &sharedIndexInformer{
-		processor:             &sharedProcessor{},
-		indexer:               cache.NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
-		listerWatcher:         lw,
-		objectType:            objType,
-		fullResyncPeriod:      resyncPeriod,
-		cacheMutationDetector: NewCacheMutationDetector(fmt.Sprintf("%v", reflect.TypeOf(objType))),
+		processor:        &sharedProcessor{},
+		indexer:          cache.NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
+		listerWatcher:    lw,
+		objectType:       objType,
+		fullResyncPeriod: resyncPeriod,
 	}
 	return sharedIndexInformer
 }
@@ -81,8 +79,7 @@ type sharedIndexInformer struct {
 	indexer    cache.Indexer
 	controller *Controller
 
-	processor             *sharedProcessor
-	cacheMutationDetector CacheMutationDetector
+	processor *sharedProcessor
 
 	// This block is tracked to handle late initialization of the controller
 	listerWatcher    cache.ListerWatcher
@@ -153,7 +150,6 @@ func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
 	}()
 
 	s.stopCh = stopCh
-	s.cacheMutationDetector.Run(stopCh)
 	s.processor.run(stopCh)
 	s.controller.Run(stopCh)
 }
@@ -218,10 +214,10 @@ func (s *sharedIndexInformer) AddEventHandler(handler ResourceEventHandler) erro
 	}
 
 	// in order to safely join, we have to
-	// stop sending add/update/delete notification
-	// do a list against the store
-	// send synthetic "Add" events to the new handler
-	// unblock
+	// 1. stop sending add/update/delete notifications
+	// 2. do a list against the store
+	// 3. send synthetic "Add" events to the new handler
+	// 4. unblock
 	s.blockDeltas.Lock()
 	defer s.blockDeltas.Unlock()
 
@@ -247,8 +243,6 @@ func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 	for _, d := range obj.(cache.Deltas) {
 		switch d.Type {
 		case cache.Sync, cache.Added, cache.Updated:
-			s.cacheMutationDetector.AddObject(d.Object)
-
 			if old, exists, err := s.indexer.Get(d.Object); err == nil && exists {
 				if err := s.indexer.Update(d.Object); err != nil {
 					return err
