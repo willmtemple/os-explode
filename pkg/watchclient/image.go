@@ -18,12 +18,15 @@
 package watchclient
 
 import (
+	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+
+	dtar "github.com/docker/docker/pkg/archive"
 
 	ostree "github.com/14rcole/ostree-go/pkg/otbuiltin"
 
@@ -256,20 +259,18 @@ func (wc *watchClient) explode(imgref, digest string) {
 		blobpath := strings.Join(comp, "/"+comp[1][:2]+"/")
 		blobpath = path.Join(blobstore, blobpath, "data")
 
-		commitCfg := ostree.NewCommitOptions()
-		commitCfg.Subject = blob
-		commitCfg.Tree = []string{"tar=" + blobpath}
-		commitCfg.TarAutoCreateParents = true
-		//commitCfg.Parent = lastCommit TODO: This should be fixed at some point
-		commitCfg.Fsync = false
-		commit, err := ostree.Commit(repo, "", branch, commitCfg)
+		commit, err := wc.tarTreeCommit(blobpath, branch)
 		if err != nil {
-			ctxLogger.WithFields(log.Fields{
-				"blob":   blob,
-				"branch": branch,
-				"err":    err,
-			}).Error("Failed to commit (IMAGE POISONED)")
-			return
+			// Fallback commit option
+			ctxLogger.WithField("err", err).Warn("Failed tar tree commit.")
+			commit, err = wc.explodeCommit(blobpath, branch)
+			if err != nil {
+				ctxLogger.WithFields(log.Fields{
+					"err":  err,
+					"blob": blob,
+				}).Error("Could not commit layer (IMAGE POISONED).")
+				return
+			}
 		}
 
 		//lastCommit = commit
@@ -293,4 +294,39 @@ func (wc *watchClient) explode(imgref, digest string) {
 		return
 	}
 	ctxLogger.Info("Exploded")
+}
+
+// Commit using OSTree's libarchive-based tar tree option
+func (wc *watchClient) tarTreeCommit(tarfile, branch string) (string, error) {
+	commitCfg := ostree.NewCommitOptions()
+	commitCfg.Tree = []string{"tar=" + tarfile}
+	commitCfg.TarAutoCreateParents = true
+	//commitCfg.Parent = lastCommit TODO: golang bindings for this option result in runtime error
+	commitCfg.Fsync = false
+	commit, err := ostree.Commit(wc.OSTreeConfig.FullPath, "", branch, commitCfg)
+	if err != nil {
+		return "", err
+	}
+	return commit, nil
+}
+
+// Commit from the filesystem using dockertar to unpack the archive (fallback)
+func (wc *watchClient) explodeCommit(tarfile, branch string) (string, error) {
+	tmp, err := ioutil.TempDir("", "")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+
+	if err := dtar.UntarPath(tarfile, tmp); err != nil {
+		return "", err
+	}
+
+	commitCfg := ostree.NewCommitOptions()
+	commitCfg.Fsync = false
+	commit, err := ostree.Commit(wc.OSTreeConfig.FullPath, tmp, branch, commitCfg)
+	if err != nil {
+		return "", err
+	}
+	return commit, nil
 }
